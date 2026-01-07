@@ -11,10 +11,14 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import requests
+import urllib3
 
 from auth import AzureAuthenticator
 
 logger = logging.getLogger(__name__)
+
+# Suppress SSL warnings if verification is disabled
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 @dataclass
@@ -69,18 +73,24 @@ class AzureCostExtractor:
     def extract_costs_for_date(
         self,
         scopes: List[str],
-        target_date: str
+        target_date: str,
+        end_date: Optional[str] = None
     ) -> List[CostReportData]:
         """
-        Extract cost data for all scopes for a specific date.
+        Extract cost data for all scopes for a specific date or date range.
         
         Args:
             scopes: List of Azure scope IDs
-            target_date: Date in YYYY-MM-DD format
+            target_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format (defaults to target_date for single day)
             
         Returns:
             List[CostReportData]: Cost data for each scope
         """
+        # Default end_date to target_date if not provided (single day)
+        if end_date is None:
+            end_date = target_date
+        
         results = []
         
         for scope_id in scopes:
@@ -88,12 +98,15 @@ class AzureCostExtractor:
             logger.info(f"Processing scope: {scope_name}")
             
             try:
-                csv_content = self._extract_single_scope(scope_id, target_date)
+                csv_content = self._extract_single_scope(scope_id, target_date, end_date)
+                
+                # Use date range for the label
+                date_label = target_date if target_date == end_date else f"{target_date}_to_{end_date}"
                 
                 results.append(CostReportData(
                     scope_id=scope_id,
                     scope_name=scope_name,
-                    target_date=target_date,
+                    target_date=date_label,
                     csv_content=csv_content
                 ))
                 
@@ -106,19 +119,20 @@ class AzureCostExtractor:
         
         return results
     
-    def _extract_single_scope(self, scope_id: str, target_date: str) -> bytes:
+    def _extract_single_scope(self, scope_id: str, start_date: str, end_date: str) -> bytes:
         """
         Extract cost data for a single scope.
         
         Args:
             scope_id: Azure scope ID
-            target_date: Date in YYYY-MM-DD format
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
             
         Returns:
             bytes: Raw CSV content
         """
         # Step 1: Request report generation
-        status_url = self._request_report(scope_id, target_date)
+        status_url = self._request_report(scope_id, start_date, end_date)
         
         # Step 2: Poll until ready
         download_url = self._wait_for_report(status_url)
@@ -128,13 +142,14 @@ class AzureCostExtractor:
         
         return csv_content
     
-    def _request_report(self, scope_id: str, target_date: str) -> str:
+    def _request_report(self, scope_id: str, start_date: str, end_date: str) -> str:
         """
         Request Azure to generate a cost details report.
         
         Args:
             scope_id: Azure scope ID
-            target_date: Date in YYYY-MM-DD format
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
             
         Returns:
             str: Status URL for polling
@@ -148,18 +163,20 @@ class AzureCostExtractor:
         payload = {
             "metric": "ActualCost",
             "timePeriod": {
-                "start": target_date,
-                "end": target_date
+                "start": start_date,
+                "end": end_date
             }
         }
         
-        logger.info(f"Requesting cost report for {target_date}...")
+        date_range = start_date if start_date == end_date else f"{start_date} to {end_date}"
+        logger.info(f"Requesting cost report for {date_range}...")
         
         response = requests.post(
             url,
             headers=self._auth.get_auth_headers(),
             json=payload,
-            timeout=self._request_timeout
+            timeout=self._request_timeout,
+            verify=self._auth.verify_ssl
         )
         response.raise_for_status()
         
@@ -190,7 +207,8 @@ class AzureCostExtractor:
             response = requests.get(
                 status_url,
                 headers=headers,
-                timeout=self._request_timeout
+                timeout=self._request_timeout,
+                verify=self._auth.verify_ssl
             )
             response.raise_for_status()
             
@@ -229,7 +247,7 @@ class AzureCostExtractor:
         """
         logger.info("Downloading report...")
         
-        response = requests.get(download_url, timeout=self._download_timeout)
+        response = requests.get(download_url, timeout=self._download_timeout, verify=self._auth.verify_ssl)
         response.raise_for_status()
         
         content_size = len(response.content)

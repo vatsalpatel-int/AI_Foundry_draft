@@ -31,6 +31,7 @@ class PipelineConfig:
     scopes: List[str]  # Multiple scopes for different projects
     output_path: str  # Path for output (CSV directory or Delta table)
     storage_mode: str = "csv"  # "csv" for local testing, "delta" for production
+    verify_ssl: bool = True  # Set False for corporate proxies with self-signed certs
     poll_interval: int = 30
     max_poll_attempts: int = 60
     request_timeout: int = 60
@@ -89,8 +90,14 @@ def load_config() -> PipelineConfig:
         logger.warning(f"Invalid STORAGE_MODE '{storage_mode}', defaulting to 'csv'")
         storage_mode = 'csv'
     
+    # Get SSL verification setting (disable for corporate proxies)
+    verify_ssl_str = os.getenv('VERIFY_SSL', 'true').lower()
+    verify_ssl = verify_ssl_str not in ['false', '0', 'no', 'off']
+    
     logger.info(f"Loaded configuration with {len(scopes)} scope(s)")
     logger.info(f"Storage mode: {storage_mode.upper()}")
+    if not verify_ssl:
+        logger.warning("SSL verification is DISABLED")
     
     # Build configuration object
     config = PipelineConfig(
@@ -102,6 +109,7 @@ def load_config() -> PipelineConfig:
         scopes=scopes,
         output_path=values['OUTPUT_PATH'],
         storage_mode=storage_mode,
+        verify_ssl=verify_ssl,
         poll_interval=int(os.getenv('POLL_INTERVAL', '30')),
         max_poll_attempts=int(os.getenv('MAX_POLL_ATTEMPTS', '60')),
         request_timeout=int(os.getenv('REQUEST_TIMEOUT', '60')),

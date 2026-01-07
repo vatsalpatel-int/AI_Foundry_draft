@@ -5,15 +5,20 @@ Handles OAuth 2.0 authentication with Azure AD using client credentials flow.
 Provides token management for Azure Management API access.
 """
 
+import os
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
 import requests
+import urllib3
 
 from config import AzureConfig
 
 logger = logging.getLogger(__name__)
+
+# Suppress SSL warnings if verification is disabled (for corporate proxies)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class AzureAuthenticator:
@@ -29,18 +34,23 @@ class AzureAuthenticator:
     # Azure Management API resource
     MANAGEMENT_RESOURCE = "https://management.azure.com/"
     
-    def __init__(self, config: AzureConfig, timeout: int = 30):
+    def __init__(self, config: AzureConfig, timeout: int = 30, verify_ssl: bool = True):
         """
         Initialize the authenticator.
         
         Args:
             config: Azure configuration with credentials
             timeout: Request timeout in seconds
+            verify_ssl: Whether to verify SSL certificates (set False for corporate proxies)
         """
         self._config = config
         self._timeout = timeout
+        self._verify_ssl = verify_ssl
         self._token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
+        
+        if not verify_ssl:
+            logger.warning("SSL verification is DISABLED - use only for testing behind corporate proxies")
     
     @property
     def token(self) -> str:
@@ -86,7 +96,7 @@ class AzureAuthenticator:
         
         logger.info("Requesting new Azure access token...")
         
-        response = requests.post(url, data=payload, timeout=self._timeout)
+        response = requests.post(url, data=payload, timeout=self._timeout, verify=self._verify_ssl)
         response.raise_for_status()
         
         data = response.json()
@@ -113,8 +123,14 @@ class AzureAuthenticator:
         """
         return {
             'Authorization': f'Bearer {self.token}',
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
         }
+    
+    @property
+    def verify_ssl(self) -> bool:
+        """Get SSL verification setting."""
+        return self._verify_ssl
     
     def invalidate_token(self) -> None:
         """Force token refresh on next request."""

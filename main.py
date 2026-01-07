@@ -46,6 +46,8 @@ logger = logging.getLogger("CostPipeline")
 
 def run_pipeline(
     target_dates: Optional[List[str]] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     use_merge: bool = True
 ) -> dict:
     """
@@ -54,6 +56,8 @@ def run_pipeline(
     Args:
         target_dates: List of dates to process (YYYY-MM-DD format).
                      Defaults to yesterday if not provided.
+        start_date: Start date for date range extraction (YYYY-MM-DD)
+        end_date: End date for date range extraction (YYYY-MM-DD)
         use_merge: If True, use MERGE for idempotency. If False, use APPEND.
         
     Returns:
@@ -93,7 +97,7 @@ def run_pipeline(
         logger.info("STEP 2: Authenticating with Azure AD...")
         logger.info("=" * 60)
         
-        authenticator = AzureAuthenticator(config.azure)
+        authenticator = AzureAuthenticator(config.azure, verify_ssl=config.verify_ssl)
         # Trigger authentication to validate credentials early
         _ = authenticator.token
         logger.info("Authentication successful")
@@ -130,46 +134,83 @@ def run_pipeline(
         logger.info("STEP 4: Extracting and loading cost data...")
         logger.info("=" * 60)
         
-        # Default to yesterday if no dates provided
-        if not target_dates:
-            yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-            target_dates = [yesterday]
-        
-        for target_date in target_dates:
+        # Handle date range mode (start_date + end_date)
+        if start_date and end_date:
             logger.info(f"\n{'─' * 40}")
-            logger.info(f"Processing date: {target_date}")
+            logger.info(f"Processing date range: {start_date} to {end_date}")
             logger.info(f"{'─' * 40}")
             
             try:
-                # Extract data from all scopes
+                # Extract data for the entire date range
                 cost_reports = extractor.extract_costs_for_date(
                     scopes=config.scopes,
-                    target_date=target_date
+                    target_date=start_date,
+                    end_date=end_date
                 )
                 
                 if not cost_reports:
-                    logger.warning(f"No data extracted for {target_date}")
-                    continue
-                
-                # Write to storage (CSV or Delta Lake)
-                rows_written = writer.write_cost_data(
-                    cost_reports=cost_reports,
-                    use_merge=use_merge
-                )
-                
-                stats["dates_processed"].append(target_date)
-                stats["total_rows"] += rows_written
-                
-                # Track unique scopes
-                for report in cost_reports:
-                    if report.scope_name not in stats["scopes_processed"]:
-                        stats["scopes_processed"].append(report.scope_name)
-                
+                    logger.warning(f"No data extracted for {start_date} to {end_date}")
+                else:
+                    # Write to storage (CSV or Delta Lake)
+                    rows_written = writer.write_cost_data(
+                        cost_reports=cost_reports,
+                        use_merge=use_merge
+                    )
+                    
+                    stats["dates_processed"].append(f"{start_date} to {end_date}")
+                    stats["total_rows"] += rows_written
+                    
+                    for report in cost_reports:
+                        if report.scope_name not in stats["scopes_processed"]:
+                            stats["scopes_processed"].append(report.scope_name)
+                            
             except Exception as e:
-                error_msg = f"Error processing {target_date}: {str(e)}"
+                error_msg = f"Error processing {start_date} to {end_date}: {str(e)}"
                 logger.error(error_msg)
                 stats["errors"].append(error_msg)
-                continue
+        
+        else:
+            # Single date mode (original behavior)
+            # Default to yesterday if no dates provided
+            if not target_dates:
+                yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+                target_dates = [yesterday]
+            
+            for target_date in target_dates:
+                logger.info(f"\n{'─' * 40}")
+                logger.info(f"Processing date: {target_date}")
+                logger.info(f"{'─' * 40}")
+                
+                try:
+                    # Extract data from all scopes
+                    cost_reports = extractor.extract_costs_for_date(
+                        scopes=config.scopes,
+                        target_date=target_date
+                    )
+                    
+                    if not cost_reports:
+                        logger.warning(f"No data extracted for {target_date}")
+                        continue
+                    
+                    # Write to storage (CSV or Delta Lake)
+                    rows_written = writer.write_cost_data(
+                        cost_reports=cost_reports,
+                        use_merge=use_merge
+                    )
+                    
+                    stats["dates_processed"].append(target_date)
+                    stats["total_rows"] += rows_written
+                    
+                    # Track unique scopes
+                    for report in cost_reports:
+                        if report.scope_name not in stats["scopes_processed"]:
+                            stats["scopes_processed"].append(report.scope_name)
+                    
+                except Exception as e:
+                    error_msg = f"Error processing {target_date}: {str(e)}"
+                    logger.error(error_msg)
+                    stats["errors"].append(error_msg)
+                    continue
         
         # ═══════════════════════════════════════════════════════════════════
         # STEP 5: Finalize
@@ -239,10 +280,12 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py                    # Process yesterday's data
-  python main.py --date 2026-01-05  # Process specific date
-  python main.py --days 7           # Backfill last 7 days
-  python main.py --no-merge         # Use APPEND instead of MERGE
+  python main.py                              # Process yesterday's data
+  python main.py --date 2026-01-05            # Process specific date
+  python main.py --days 7                     # Backfill last 7 days
+  python main.py --lifetime                   # Get ALL available cost data (13 months)
+  python main.py --start 2025-01-01 --end 2026-01-07  # Custom date range
+  python main.py --no-merge                   # Use APPEND instead of MERGE
         """
     )
     
@@ -255,7 +298,25 @@ Examples:
     parser.add_argument(
         "--days",
         type=int,
-        help="Number of days to backfill (mutually exclusive with --date)"
+        help="Number of days to backfill"
+    )
+    
+    parser.add_argument(
+        "--lifetime",
+        action="store_true",
+        help="Extract ALL available cost data (typically 13 months of history)"
+    )
+    
+    parser.add_argument(
+        "--start",
+        type=str,
+        help="Start date for custom range (YYYY-MM-DD format, use with --end)"
+    )
+    
+    parser.add_argument(
+        "--end",
+        type=str,
+        help="End date for custom range (YYYY-MM-DD format, use with --start)"
     )
     
     parser.add_argument(
@@ -276,7 +337,17 @@ if __name__ == "__main__":
     
     use_merge = not args.no_merge
     
-    if args.days:
+    if args.lifetime:
+        # Lifetime mode - get all available data (13 months back)
+        from dateutil.relativedelta import relativedelta
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - relativedelta(months=13)).strftime('%Y-%m-%d')
+        logger.info(f"Lifetime mode: extracting data from {start_date} to {end_date}")
+        result = run_pipeline(start_date=start_date, end_date=end_date, use_merge=use_merge)
+    elif args.start and args.end:
+        # Custom date range mode
+        result = run_pipeline(start_date=args.start, end_date=args.end, use_merge=use_merge)
+    elif args.days:
         # Backfill mode
         result = run_backfill(days=args.days, use_merge=use_merge)
     elif args.date:
