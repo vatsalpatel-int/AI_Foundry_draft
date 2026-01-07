@@ -6,13 +6,15 @@ It orchestrates the flow:
     1. Load configuration
     2. Authenticate with Azure
     3. Extract cost data from all configured scopes
-    4. Write to Delta Lake with idempotent MERGE
+    4. Write to CSV (local testing) or Delta Lake (production)
 
-Designed to run in Databricks Runtime (DBR) environment.
+Supports two storage modes:
+    - CSV: For local testing (no Spark/Databricks required)
+    - Delta: For production (requires Databricks Runtime)
 
 Usage:
-    - As Databricks notebook: Just run the cells
     - As script: python main.py [--date YYYY-MM-DD] [--days N] [--no-merge]
+    - As Databricks notebook: Just run the cells
     
 Example:
     # Run for yesterday (default)
@@ -61,7 +63,6 @@ def run_pipeline(
     from config import load_config
     from auth import AzureAuthenticator
     from data_extractor import AzureCostExtractor
-    from delta_writer import DeltaLakeWriter
     
     # Track execution stats
     stats = {
@@ -82,7 +83,8 @@ def run_pipeline(
         
         config = load_config()
         logger.info(f"Configured scopes: {len(config.scopes)}")
-        logger.info(f"Delta table path: {config.delta_table_path}")
+        logger.info(f"Storage mode: {config.storage_mode.upper()}")
+        logger.info(f"Output path: {config.output_path}")
         
         # ═══════════════════════════════════════════════════════════════════
         # STEP 2: Authenticate with Azure
@@ -111,7 +113,15 @@ def run_pipeline(
             download_timeout=config.download_timeout
         )
         
-        writer = DeltaLakeWriter(config.delta_table_path)
+        # Initialize writer based on storage mode
+        if config.storage_mode == "csv":
+            from csv_writer import CSVWriter
+            writer = CSVWriter(config.output_path)
+            logger.info("Using CSV writer (local testing mode)")
+        else:
+            from delta_writer import DeltaLakeWriter
+            writer = DeltaLakeWriter(config.output_path)
+            logger.info("Using Delta Lake writer (production mode)")
         
         # ═══════════════════════════════════════════════════════════════════
         # STEP 4: Process Each Date
@@ -141,7 +151,7 @@ def run_pipeline(
                     logger.warning(f"No data extracted for {target_date}")
                     continue
                 
-                # Write to Delta Lake
+                # Write to storage (CSV or Delta Lake)
                 rows_written = writer.write_cost_data(
                     cost_reports=cost_reports,
                     use_merge=use_merge

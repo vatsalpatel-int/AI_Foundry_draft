@@ -29,7 +29,8 @@ class PipelineConfig:
     """Complete pipeline configuration."""
     azure: AzureConfig
     scopes: List[str]  # Multiple scopes for different projects
-    delta_table_path: str
+    output_path: str  # Path for output (CSV directory or Delta table)
+    storage_mode: str = "csv"  # "csv" for local testing, "delta" for production
     poll_interval: int = 30
     max_poll_attempts: int = 60
     request_timeout: int = 60
@@ -55,7 +56,7 @@ def load_config() -> PipelineConfig:
         'AZURE_CLIENT_ID': 'Azure Service Principal Client ID',
         'AZURE_CLIENT_SECRET': 'Azure Service Principal Client Secret',
         'AZURE_SCOPES': 'Comma-separated list of Azure scopes',
-        'DELTA_TABLE_PATH': 'Delta Lake table path (S3/ADLS/DBFS)'
+        'OUTPUT_PATH': 'Output path (local directory for CSV or Delta table path)'
     }
     
     # Collect values and check for missing
@@ -82,7 +83,14 @@ def load_config() -> PipelineConfig:
         logger.error("AZURE_SCOPES must contain at least one scope")
         sys.exit(1)
     
+    # Get storage mode (csv for local testing, delta for production)
+    storage_mode = os.getenv('STORAGE_MODE', 'csv').lower()
+    if storage_mode not in ['csv', 'delta']:
+        logger.warning(f"Invalid STORAGE_MODE '{storage_mode}', defaulting to 'csv'")
+        storage_mode = 'csv'
+    
     logger.info(f"Loaded configuration with {len(scopes)} scope(s)")
+    logger.info(f"Storage mode: {storage_mode.upper()}")
     
     # Build configuration object
     config = PipelineConfig(
@@ -92,7 +100,8 @@ def load_config() -> PipelineConfig:
             client_secret=values['AZURE_CLIENT_SECRET']
         ),
         scopes=scopes,
-        delta_table_path=values['DELTA_TABLE_PATH'],
+        output_path=values['OUTPUT_PATH'],
+        storage_mode=storage_mode,
         poll_interval=int(os.getenv('POLL_INTERVAL', '30')),
         max_poll_attempts=int(os.getenv('MAX_POLL_ATTEMPTS', '60')),
         request_timeout=int(os.getenv('REQUEST_TIMEOUT', '60')),
