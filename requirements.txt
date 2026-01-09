@@ -7,6 +7,9 @@ requests>=2.28.0
 # Environment variable management
 python-dotenv>=1.0.0
 
+# Authentication (Azure CLI & Service Principal)
+azure-identity>=1.15.0
+
 # Data processing (for CSV mode)
 pandas>=2.0.0
 

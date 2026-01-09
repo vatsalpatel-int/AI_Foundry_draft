@@ -3,13 +3,14 @@ Configuration Management Module
 
 Handles loading and validating configuration from environment variables.
 Supports multiple Azure scopes for multi-project cost extraction.
+Supports multiple authentication modes (CLI/Browser for dev, Service Principal for prod).
 """
 
 import os
 import sys
 import logging
-from dataclasses import dataclass, field
-from typing import List
+from dataclasses import dataclass
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class AzureConfig:
-    """Azure authentication configuration."""
+    """Azure authentication configuration for Service Principal mode."""
     tenant_id: str
     client_id: str
     client_secret: str
@@ -27,9 +28,10 @@ class AzureConfig:
 @dataclass
 class PipelineConfig:
     """Complete pipeline configuration."""
-    azure: AzureConfig
     scopes: List[str]  # Multiple scopes for different projects
     output_path: str  # Path for output (CSV directory or Delta table)
+    auth_mode: str = "cli"  # "cli", "browser", "service_principal"
+    azure: Optional[AzureConfig] = None  # Only required for service_principal mode
     storage_mode: str = "csv"  # "csv" for local testing, "delta" for production
     verify_ssl: bool = True  # Set False for corporate proxies with self-signed certs
     poll_interval: int = 30
@@ -51,14 +53,30 @@ def load_config() -> PipelineConfig:
     # Load .env file
     load_dotenv()
     
-    # Required environment variables
-    required_vars = {
-        'AZURE_TENANT_ID': 'Azure AD Tenant ID',
-        'AZURE_CLIENT_ID': 'Azure Service Principal Client ID',
-        'AZURE_CLIENT_SECRET': 'Azure Service Principal Client Secret',
-        'AZURE_SCOPES': 'Comma-separated list of Azure scopes',
-        'OUTPUT_PATH': 'Output path (local directory for CSV or Delta table path)'
-    }
+    # Get authentication mode (default to CLI for easier development)
+    auth_mode = os.getenv('AUTH_MODE', 'cli').lower().strip()
+    
+    if auth_mode not in ['cli', 'browser', 'service_principal']:
+        logger.warning(f"Invalid AUTH_MODE '{auth_mode}', defaulting to 'cli'")
+        auth_mode = 'cli'
+    
+    logger.info(f"Authentication mode: {auth_mode.upper()}")
+    
+    # Define required variables based on auth mode
+    if auth_mode == 'service_principal':
+        required_vars = {
+            'AZURE_TENANT_ID': 'Azure AD Tenant ID',
+            'AZURE_CLIENT_ID': 'Azure Service Principal Client ID',
+            'AZURE_CLIENT_SECRET': 'Azure Service Principal Client Secret',
+            'AZURE_SCOPES': 'Comma-separated list of Azure scopes',
+            'OUTPUT_PATH': 'Output path (local directory for CSV or Delta table path)'
+        }
+    else:
+        # CLI/Browser mode - only need scopes and output path
+        required_vars = {
+            'AZURE_SCOPES': 'Comma-separated list of Azure scopes',
+            'OUTPUT_PATH': 'Output path (local directory for CSV or Delta table path)'
+        }
     
     # Collect values and check for missing
     values = {}
@@ -99,13 +117,19 @@ def load_config() -> PipelineConfig:
     if not verify_ssl:
         logger.warning("SSL verification is DISABLED")
     
-    # Build configuration object
-    config = PipelineConfig(
-        azure=AzureConfig(
+    # Build Azure config only for service_principal mode
+    azure_config = None
+    if auth_mode == 'service_principal':
+        azure_config = AzureConfig(
             tenant_id=values['AZURE_TENANT_ID'],
             client_id=values['AZURE_CLIENT_ID'],
             client_secret=values['AZURE_CLIENT_SECRET']
-        ),
+        )
+    
+    # Build configuration object
+    config = PipelineConfig(
+        auth_mode=auth_mode,
+        azure=azure_config,
         scopes=scopes,
         output_path=values['OUTPUT_PATH'],
         storage_mode=storage_mode,

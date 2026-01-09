@@ -40,6 +40,8 @@ This pipeline automates the entire process:
 4. **Loads** into Delta Lake with idempotent MERGE operations
 5. **Partitions** by date for efficient querying
 
+> **Note**: This pipeline uses the Azure Cost Management **Query API** which supports all subscription types including **Pay-As-You-Go (PAYG)**, Enterprise Agreement (EA), and Microsoft Customer Agreement (MCA).
+
 ---
 
 ## Architecture
@@ -74,8 +76,8 @@ This pipeline automates the entire process:
 │  │   │   .py    │    │   .py    │    │ extractor.py │    │  writer.py   │      │ │
 │  │   └──────────┘    └──────────┘    └──────────────┘    └──────────────┘      │ │
 │  │        │               │                 │                   │               │ │
-│  │   Load .env      OAuth Token       Extract CSV          MERGE to            │ │
-│  │   Validate       Management        from Azure           Delta Lake          │ │
+│  │   Load .env      OAuth Token       Query API            MERGE to            │ │
+│  │   Validate       Management        JSON → CSV           Delta Lake          │ │
 │  │                                                                              │ │
 │  └──────────────────────────────────────────────────────────────────────────────┘ │
 │                                      │                                            │
@@ -150,39 +152,39 @@ STEP 3: AUTHENTICATION
   └─────────────────────────────────────────────────────────┘
                     │
                     ▼
-STEP 4: REQUEST REPORT (for each scope)
-═══════════════════════════════════════
+STEP 4: QUERY COST DATA (for each scope)
+════════════════════════════════════════
   ┌─────────────────────────────────────────────────────────┐
   │  data_extractor.py                                      │
   │  ─────────────────                                      │
-  │  • POST to Cost Management API                          │
-  │  • Request: { metric: "ActualCost",                     │
-  │               timePeriod: { start, end } }              │
-  │  • Response: 202 Accepted + Location header             │
+  │  • POST to Cost Management Query API                    │
+  │  • Request: { type: "Usage", timeframe: "Custom",       │
+  │               timePeriod: { from, to },                 │
+  │               dataset: { granularity: "Daily" } }       │
+  │  • Response: JSON with columns and rows                 │
   │                                                         │
   │  API: https://management.azure.com/{scope}/             │
-  │       providers/Microsoft.CostManagement/               │
-  │       generateCostDetailsReport                         │
+  │       providers/Microsoft.CostManagement/query          │
+  │       ?api-version=2025-03-01                           │
   └─────────────────────────────────────────────────────────┘
                     │
                     ▼
-STEP 5: POLL FOR COMPLETION
-═══════════════════════════
+STEP 5: HANDLE PAGINATION
+═════════════════════════
   ┌─────────────────────────────────────────────────────────┐
-  │  • GET status URL every 30 seconds                      │
-  │  • Status: "InProgress" → keep polling                  │
-  │  • Status: "Completed" → get download URL               │
-  │  • Status: "Failed" → raise error                       │
-  │  • Timeout after 60 attempts (30 minutes)               │
+  │  • Check for nextLink in response                       │
+  │  • If present, GET next page of results                 │
+  │  • Repeat until no more pages                           │
+  │  • Combine all rows into single result                  │
   └─────────────────────────────────────────────────────────┘
                     │
                     ▼
-STEP 6: DOWNLOAD CSV
-════════════════════
+STEP 6: CONVERT TO CSV
+══════════════════════
   ┌─────────────────────────────────────────────────────────┐
-  │  • GET blob download URL                                │
-  │  • Receive CSV data (can be several MB)                 │
-  │  • Store in memory as bytes                             │
+  │  • Extract column names from response                   │
+  │  • Convert JSON rows to CSV format                      │
+  │  • Store as bytes for compatibility                     │
   └─────────────────────────────────────────────────────────┘
                     │
                     ▼
@@ -235,10 +237,10 @@ AI_Foundry/
 │   │   • Token caching and auto-refresh
 │   │   • Authorization header generation
 │
-├── 📄 data_extractor.py       # Azure Cost Management API client
-│   │   • Request cost report generation
-│   │   • Poll for completion status
-│   │   • Download CSV reports
+├── 📄 data_extractor.py       # Azure Cost Management Query API client
+│   │   • Query cost data via REST API
+│   │   • Handle pagination (nextLink)
+│   │   • Convert JSON response to CSV
 │   │   • Support multiple scopes
 │
 ├── 📄 delta_writer.py         # Delta Lake operations
@@ -347,16 +349,14 @@ DELTA_TABLE_PATH=s3a://your-bucket/warehouse/ai_foundry_costs
 # OPTIONAL: Pipeline Tuning
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Seconds between status poll attempts (default: 30)
+# Legacy settings (kept for backward compatibility, not used by Query API)
 POLL_INTERVAL=30
-
-# Maximum poll attempts before timeout (default: 60 = 30 minutes)
 MAX_POLL_ATTEMPTS=60
 
 # API request timeout in seconds (default: 60)
 REQUEST_TIMEOUT=60
 
-# Report download timeout in seconds (default: 300)
+# Pagination request timeout in seconds (default: 300)
 DOWNLOAD_TIMEOUT=300
 ```
 
@@ -445,9 +445,21 @@ print(stats)
 
 ## Data Schema
 
-### Raw Data from Azure Cost Management API
+### Raw Data from Azure Cost Management Query API
 
-The API returns CSV data with the following columns:
+The Query API returns JSON data which is converted to CSV format. The columns returned depend on the query configuration. With daily granularity, the response includes:
+
+| Column | Data Type | Description |
+|--------|-----------|-------------|
+| `PreTaxCost` | NUMBER | Cost amount before tax |
+| `UsageDate` | NUMBER | Date in YYYYMMDD format |
+| `Currency` | STRING | Currency code (e.g., "USD") |
+
+> **Note**: The Query API returns aggregated data. For detailed line-item data with all columns shown below, consider using the Exports API for scheduled exports to blob storage.
+
+### Full Schema Reference (Exports API / Legacy)
+
+The following columns are available when using detailed cost exports:
 
 | Category | Column Name | Data Type | Description |
 |----------|-------------|-----------|-------------|
@@ -593,8 +605,8 @@ tasks:
 | `ModuleNotFoundError: requests` | venv not activated | Run `source venv/bin/activate` |
 | `401 Unauthorized` | Invalid credentials | Check AZURE_CLIENT_ID and AZURE_CLIENT_SECRET |
 | `403 Forbidden` | Missing permissions | Assign "Cost Management Reader" role to SP |
-| `No Location header` | API error | Check scope format, ensure costs exist for date |
-| `TimeoutError` | Report taking too long | Increase MAX_POLL_ATTEMPTS |
+| `400 Bad Request` | Invalid scope or date format | Check scope format, ensure dates are valid |
+| `Empty response` | No cost data for date range | Verify costs exist for the specified period |
 | `spark not defined` | Not in Databricks | Run in Databricks Runtime environment |
 
 ### Debugging
@@ -636,9 +648,27 @@ Internal use only. Contact your administrator for licensing information.
 
 ---
 
+## API Reference
+
+This pipeline uses the **Azure Cost Management Query API**:
+
+- **Endpoint**: `POST https://management.azure.com/{scope}/providers/Microsoft.CostManagement/query?api-version=2025-03-01`
+- **Documentation**: [Query - Usage API Reference](https://learn.microsoft.com/en-gb/rest/api/cost-management/query/usage?view=rest-cost-management-2025-03-01)
+
+### Supported Subscription Types
+
+| Subscription Type | Supported |
+|-------------------|-----------|
+| Pay-As-You-Go (PAYG) | ✅ Yes |
+| Enterprise Agreement (EA) | ✅ Yes |
+| Microsoft Customer Agreement (MCA) | ✅ Yes |
+| CSP (Cloud Solution Provider) | ✅ Yes |
+
+---
+
 ## Support
 
 For issues or questions:
 1. Check the [Troubleshooting](#troubleshooting) section
-2. Review Azure Cost Management API documentation
+2. Review [Azure Cost Management Query API documentation](https://learn.microsoft.com/en-gb/rest/api/cost-management/query/usage)
 3. Contact your platform team

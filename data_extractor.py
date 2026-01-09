@@ -1,19 +1,23 @@
 """
 Azure Cost Data Extractor Module
 
-Handles requesting, polling, and downloading cost reports from Azure Cost Management API.
+Handles requesting and processing cost data from Azure Cost Management Query API.
 Supports multiple scopes for extracting costs from different projects/subscriptions.
+
+Uses the Query API which supports all subscription types including Pay-As-You-Go (PAYG).
 """
 
+import io
+import csv
 import time
 import logging
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 import requests
 import urllib3
 
-from auth import AzureAuthenticator
+from auth import BaseAuthenticator
 
 logger = logging.getLogger(__name__)
 
@@ -33,22 +37,29 @@ class CostReportData:
 
 class AzureCostExtractor:
     """
-    Extracts cost data from Azure Cost Management API.
+    Extracts cost data from Azure Cost Management Query API.
     
     Supports multiple scopes (subscriptions, management groups, resource groups)
     for consolidated cost reporting across Azure AI Foundry projects.
+    
+    Uses the Query API (supports PAYG) instead of generateCostDetailsReport (EA/MCA only).
     """
     
-    # API endpoint template
-    COST_REPORT_URL_TEMPLATE = (
+    # Query API endpoint template
+    QUERY_URL_TEMPLATE = (
         "https://management.azure.com/{scope_id}/"
-        "providers/Microsoft.CostManagement/generateCostDetailsReport"
-        "?api-version=2023-11-01"
+        "providers/Microsoft.CostManagement/query"
+        "?api-version=2025-03-01"
     )
+    
+    # Retry configuration
+    MAX_RETRIES = 5
+    INITIAL_BACKOFF_SECONDS = 2
+    MAX_BACKOFF_SECONDS = 120
     
     def __init__(
         self,
-        authenticator: AzureAuthenticator,
+        authenticator: BaseAuthenticator,
         poll_interval: int = 30,
         max_poll_attempts: int = 60,
         request_timeout: int = 60,
@@ -58,15 +69,15 @@ class AzureCostExtractor:
         Initialize the cost extractor.
         
         Args:
-            authenticator: Azure authenticator instance
-            poll_interval: Seconds between status poll attempts
-            max_poll_attempts: Maximum number of poll attempts before timeout
+            authenticator: Azure authenticator instance (CLI or Service Principal)
+            poll_interval: Unused (kept for backward compatibility)
+            max_poll_attempts: Unused (kept for backward compatibility)
             request_timeout: Timeout for API requests in seconds
-            download_timeout: Timeout for downloading reports in seconds
+            download_timeout: Timeout for pagination requests in seconds
         """
         self._auth = authenticator
-        self._poll_interval = poll_interval
-        self._max_poll_attempts = max_poll_attempts
+        self._poll_interval = poll_interval  # Unused but kept for compatibility
+        self._max_poll_attempts = max_poll_attempts  # Unused but kept for compatibility
         self._request_timeout = request_timeout
         self._download_timeout = download_timeout
     
@@ -98,7 +109,7 @@ class AzureCostExtractor:
             logger.info(f"Processing scope: {scope_name}")
             
             try:
-                csv_content = self._extract_single_scope(scope_id, target_date, end_date)
+                csv_content, row_count = self._extract_single_scope(scope_id, target_date, end_date)
                 
                 # Use date range for the label
                 date_label = target_date if target_date == end_date else f"{target_date}_to_{end_date}"
@@ -107,10 +118,11 @@ class AzureCostExtractor:
                     scope_id=scope_id,
                     scope_name=scope_name,
                     target_date=date_label,
-                    csv_content=csv_content
+                    csv_content=csv_content,
+                    row_count=row_count
                 ))
                 
-                logger.info(f"Successfully extracted data for {scope_name}")
+                logger.info(f"Successfully extracted {row_count} rows for {scope_name}")
                 
             except Exception as e:
                 logger.error(f"Failed to extract data for {scope_name}: {str(e)}")
@@ -119,9 +131,9 @@ class AzureCostExtractor:
         
         return results
     
-    def _extract_single_scope(self, scope_id: str, start_date: str, end_date: str) -> bytes:
+    def _extract_single_scope(self, scope_id: str, start_date: str, end_date: str) -> tuple:
         """
-        Extract cost data for a single scope.
+        Extract cost data for a single scope using Query API.
         
         Args:
             scope_id: Azure scope ID
@@ -129,22 +141,155 @@ class AzureCostExtractor:
             end_date: End date in YYYY-MM-DD format
             
         Returns:
-            bytes: Raw CSV content
+            tuple: (csv_content as bytes, row_count)
         """
-        # Step 1: Request report generation
-        status_url = self._request_report(scope_id, start_date, end_date)
+        # Step 1: Make Query API request
+        all_rows = []
+        columns = None
         
-        # Step 2: Poll until ready
-        download_url = self._wait_for_report(status_url)
+        response_data = self._make_query_request(scope_id, start_date, end_date)
+        columns = response_data["properties"]["columns"]
+        all_rows.extend(response_data["properties"].get("rows", []))
         
-        # Step 3: Download the report
-        csv_content = self._download_report(download_url)
+        logger.info(f"Initial query returned {len(response_data['properties'].get('rows', []))} rows")
         
-        return csv_content
+        # Step 2: Handle pagination via nextLink
+        page_count = 1
+        while response_data["properties"].get("nextLink"):
+            page_count += 1
+            logger.info(f"Fetching page {page_count}...")
+            response_data = self._fetch_next_page(response_data["properties"]["nextLink"])
+            new_rows = response_data["properties"].get("rows", [])
+            all_rows.extend(new_rows)
+            logger.info(f"Page {page_count} returned {len(new_rows)} rows")
+        
+        logger.info(f"Total rows collected: {len(all_rows)} across {page_count} page(s)")
+        
+        # Step 3: Convert to CSV bytes (maintains compatibility with writers)
+        csv_content = self._convert_to_csv(columns, all_rows)
+        
+        return csv_content, len(all_rows)
     
-    def _request_report(self, scope_id: str, start_date: str, end_date: str) -> str:
+    def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        payload: Optional[Dict] = None,
+        timeout: int = 60
+    ) -> requests.Response:
         """
-        Request Azure to generate a cost details report.
+        Make an HTTP request with retry logic for transient errors.
+        
+        Handles:
+        - 401 Unauthorized: Refreshes token and retries
+        - 429 Too Many Requests: Exponential backoff
+        - 5xx Server Errors: Exponential backoff
+        
+        Args:
+            method: HTTP method ('GET' or 'POST')
+            url: Request URL
+            payload: JSON payload for POST requests
+            timeout: Request timeout in seconds
+            
+        Returns:
+            requests.Response: Successful response
+            
+        Raises:
+            requests.RequestException: If all retries fail
+        """
+        last_exception = None
+        backoff = self.INITIAL_BACKOFF_SECONDS
+        
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                # Always get fresh headers (handles token refresh)
+                headers = self._auth.get_auth_headers()
+                
+                if method.upper() == 'POST':
+                    response = requests.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=timeout,
+                        verify=self._auth.verify_ssl
+                    )
+                else:
+                    response = requests.get(
+                        url,
+                        headers=headers,
+                        timeout=timeout,
+                        verify=self._auth.verify_ssl
+                    )
+                
+                # Check for retryable status codes
+                if response.status_code == 401:
+                    # Token expired or invalid - invalidate and retry
+                    logger.warning(f"401 Unauthorized - refreshing token (attempt {attempt + 1}/{self.MAX_RETRIES})")
+                    logger.debug(f"Response: {response.text[:500]}")
+                    self._auth.invalidate_token()
+                    time.sleep(1)  # Brief pause before retry
+                    continue
+                
+                elif response.status_code == 429:
+                    # Rate limited - use Retry-After header if available
+                    retry_after = response.headers.get('Retry-After')
+                    if retry_after:
+                        wait_time = int(retry_after)
+                    else:
+                        wait_time = min(backoff, self.MAX_BACKOFF_SECONDS)
+                    
+                    logger.warning(
+                        f"429 Too Many Requests - waiting {wait_time}s "
+                        f"(attempt {attempt + 1}/{self.MAX_RETRIES})"
+                    )
+                    time.sleep(wait_time)
+                    backoff *= 2  # Exponential backoff
+                    continue
+                
+                elif response.status_code >= 500:
+                    # Server error - retry with backoff
+                    wait_time = min(backoff, self.MAX_BACKOFF_SECONDS)
+                    logger.warning(
+                        f"{response.status_code} Server Error - waiting {wait_time}s "
+                        f"(attempt {attempt + 1}/{self.MAX_RETRIES})"
+                    )
+                    time.sleep(wait_time)
+                    backoff *= 2
+                    continue
+                
+                # Success or non-retryable error
+                response.raise_for_status()
+                return response
+                
+            except requests.exceptions.Timeout as e:
+                last_exception = e
+                wait_time = min(backoff, self.MAX_BACKOFF_SECONDS)
+                logger.warning(
+                    f"Request timeout - waiting {wait_time}s "
+                    f"(attempt {attempt + 1}/{self.MAX_RETRIES})"
+                )
+                time.sleep(wait_time)
+                backoff *= 2
+                
+            except requests.exceptions.ConnectionError as e:
+                last_exception = e
+                wait_time = min(backoff, self.MAX_BACKOFF_SECONDS)
+                logger.warning(
+                    f"Connection error - waiting {wait_time}s "
+                    f"(attempt {attempt + 1}/{self.MAX_RETRIES})"
+                )
+                time.sleep(wait_time)
+                backoff *= 2
+        
+        # All retries exhausted
+        if last_exception:
+            raise last_exception
+        else:
+            raise requests.RequestException(f"Request failed after {self.MAX_RETRIES} attempts")
+    
+    def _make_query_request(self, scope_id: str, start_date: str, end_date: str) -> Dict[str, Any]:
+        """
+        Make the initial Query API request.
         
         Args:
             scope_id: Azure scope ID
@@ -152,108 +297,90 @@ class AzureCostExtractor:
             end_date: End date in YYYY-MM-DD format
             
         Returns:
-            str: Status URL for polling
+            dict: JSON response from Query API
             
         Raises:
             requests.RequestException: If request fails
-            ValueError: If no status URL returned
         """
-        url = self.COST_REPORT_URL_TEMPLATE.format(scope_id=scope_id)
+        url = self.QUERY_URL_TEMPLATE.format(scope_id=scope_id)
         
+        # Query API request body
         payload = {
-            "metric": "ActualCost",
+            "type": "Usage",
+            "timeframe": "Custom",
             "timePeriod": {
-                "start": start_date,
-                "end": end_date
+                "from": f"{start_date}T00:00:00+00:00",
+                "to": f"{end_date}T23:59:59+00:00"
+            },
+            "dataset": {
+                "granularity": "Daily"
             }
         }
         
         date_range = start_date if start_date == end_date else f"{start_date} to {end_date}"
-        logger.info(f"Requesting cost report for {date_range}...")
+        logger.info(f"Querying cost data for {date_range}...")
         
-        response = requests.post(
-            url,
-            headers=self._auth.get_auth_headers(),
-            json=payload,
-            timeout=self._request_timeout,
-            verify=self._auth.verify_ssl
+        response = self._request_with_retry(
+            method='POST',
+            url=url,
+            payload=payload,
+            timeout=self._request_timeout
         )
-        response.raise_for_status()
         
-        status_url = response.headers.get('Location')
-        if not status_url:
-            raise ValueError("No Location header in response - report request may have failed")
-        
-        logger.info("Report generation initiated")
-        return status_url
+        return response.json()
     
-    def _wait_for_report(self, status_url: str) -> str:
+    def _fetch_next_page(self, next_link: str) -> Dict[str, Any]:
         """
-        Poll until the report is ready for download.
+        Fetch the next page of results using nextLink.
         
         Args:
-            status_url: URL to poll for status
+            next_link: URL for the next page of results
             
         Returns:
-            str: Download URL for the report
-            
-        Raises:
-            TimeoutError: If report doesn't complete in time
-            RuntimeError: If report generation fails
+            dict: JSON response from Query API
         """
-        headers = self._auth.get_auth_headers()
-        
-        for attempt in range(self._max_poll_attempts):
-            response = requests.get(
-                status_url,
-                headers=headers,
-                timeout=self._request_timeout,
-                verify=self._auth.verify_ssl
-            )
-            response.raise_for_status()
-            
-            status_data = response.json()
-            status = status_data.get('status')
-            
-            if status == 'Completed':
-                download_url = status_data['manifest']['blobs'][0]['blobLink']
-                logger.info("Report generation completed")
-                return download_url
-            
-            elif status == 'Failed':
-                error_msg = status_data.get('error', {}).get('message', 'Unknown error')
-                raise RuntimeError(f"Report generation failed: {error_msg}")
-            
-            logger.info(
-                f"Report status: {status} - waiting {self._poll_interval}s "
-                f"(attempt {attempt + 1}/{self._max_poll_attempts})"
-            )
-            time.sleep(self._poll_interval)
-        
-        raise TimeoutError(
-            f"Report did not complete after {self._max_poll_attempts} attempts "
-            f"({self._max_poll_attempts * self._poll_interval} seconds)"
+        response = self._request_with_retry(
+            method='GET',
+            url=next_link,
+            timeout=self._download_timeout
         )
+        
+        return response.json()
     
-    def _download_report(self, download_url: str) -> bytes:
+    def _convert_to_csv(self, columns: List[Dict], rows: List[List]) -> bytes:
         """
-        Download the cost report CSV.
+        Convert Query API JSON response to CSV bytes.
+        
+        This maintains compatibility with existing csv_writer and delta_writer
+        which expect CSV content.
         
         Args:
-            download_url: URL to download from
+            columns: List of column definitions from API response
+            rows: List of row data from API response
             
         Returns:
-            bytes: Raw CSV content
+            bytes: CSV content as bytes
         """
-        logger.info("Downloading report...")
+        # Extract column names
+        column_names = [col["name"] for col in columns]
         
-        response = requests.get(download_url, timeout=self._download_timeout, verify=self._auth.verify_ssl)
-        response.raise_for_status()
+        # Write to CSV in memory
+        output = io.StringIO()
+        writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
         
-        content_size = len(response.content)
-        logger.info(f"Downloaded {content_size / 1024:.1f} KB")
+        # Write header
+        writer.writerow(column_names)
         
-        return response.content
+        # Write data rows
+        for row in rows:
+            writer.writerow(row)
+        
+        # Convert to bytes
+        csv_content = output.getvalue().encode('utf-8')
+        
+        logger.info(f"Converted {len(rows)} rows to CSV ({len(csv_content) / 1024:.1f} KB)")
+        
+        return csv_content
     
     @staticmethod
     def _extract_scope_name(scope_id: str) -> str:

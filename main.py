@@ -65,7 +65,7 @@ def run_pipeline(
     """
     # Import modules here to allow for cleaner error messages if dependencies missing
     from config import load_config
-    from auth import AzureAuthenticator
+    from auth import create_authenticator
     from data_extractor import AzureCostExtractor
     
     # Track execution stats
@@ -94,12 +94,16 @@ def run_pipeline(
         # STEP 2: Authenticate with Azure
         # ═══════════════════════════════════════════════════════════════════
         logger.info("=" * 60)
-        logger.info("STEP 2: Authenticating with Azure AD...")
+        logger.info(f"STEP 2: Authenticating with Azure ({config.auth_mode.upper()} mode)...")
         logger.info("=" * 60)
         
-        authenticator = AzureAuthenticator(config.azure, verify_ssl=config.verify_ssl)
+        authenticator = create_authenticator(
+            auth_mode=config.auth_mode,
+            config=config.azure,
+            verify_ssl=config.verify_ssl
+        )
         # Trigger authentication to validate credentials early
-        _ = authenticator.token
+        _ = authenticator.get_token()
         logger.info("Authentication successful")
         
         # ═══════════════════════════════════════════════════════════════════
