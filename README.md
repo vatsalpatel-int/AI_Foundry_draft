@@ -672,4 +672,4 @@ For issues or questions:
 1. Check the [Troubleshooting](#troubleshooting) section
 2. Review [Azure Cost Management Query API documentation](https://learn.microsoft.com/en-gb/rest/api/cost-management/query/usage)
 3. Contact your platform team
-test
+
